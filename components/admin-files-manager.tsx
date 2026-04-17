@@ -2,14 +2,20 @@
 
 import { useState, useRef, useTransition } from 'react'
 import dynamic from 'next/dynamic'
-import { createFolderAction, uploadFileAction, deleteFolderAction, deleteFileAction } from '@/app/actions/files'
+import {
+  createFolderAction,
+  uploadFileAction,
+  uploadFolderAction,
+  deleteFolderAction,
+  deleteFileAction,
+} from '@/app/actions/files'
 
-// Import PdfViewer dynamically without SSR to avoid DOMMatrix errors
 const PdfViewer = dynamic(() => import('./pdf-viewer'), { ssr: false })
 
 interface Folder {
   id: number
   name: string
+  parent_id: number | null
   file_count: number | string
   uploader_name?: string
   created_at: string
@@ -32,49 +38,86 @@ function formatBytes(bytes: number): string {
 }
 
 export default function AdminFilesManager({ initialFolders }: { initialFolders: Folder[] }) {
-  const [folders, setFolders] = useState<Folder[]>(initialFolders)
-  const [selectedFolder, setSelectedFolder] = useState<Folder | null>(null)
-  const [files, setFiles] = useState<FileItem[]>([])
-  const [loadingFiles, setLoadingFiles] = useState(false)
-  const [viewingPdf, setViewingPdf] = useState<{ pathname: string; name: string } | null>(null)
+  const [folders, setFolders]             = useState<Folder[]>(initialFolders)
+  // Stack de navegación: cada elemento es la carpeta actual
+  const [folderStack, setFolderStack]     = useState<Folder[]>([])
+  const [files, setFiles]                 = useState<FileItem[]>([])
+  const [subfolders, setSubfolders]       = useState<Folder[]>([])
+  const [loadingFiles, setLoadingFiles]   = useState(false)
+  const [viewingPdf, setViewingPdf]       = useState<{ pathname: string; name: string } | null>(null)
   const [showNewFolder, setShowNewFolder] = useState(false)
-  const [folderName, setFolderName] = useState('')
-  const [isPending, startTransition] = useTransition()
-  const [uploading, setUploading] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [folderName, setFolderName]       = useState('')
+  const [isPending, startTransition]      = useTransition()
+  const [uploading, setUploading]         = useState(false)
+  const [uploadProgress, setUploadProgress] = useState<string>('')
+  const fileInputRef   = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
 
+  const selectedFolder = folderStack[folderStack.length - 1] ?? null
+
+  // ── Carga carpetas raíz
   async function loadFolders() {
-    const res = await fetch('/api/admin/folders')
+    const res  = await fetch('/api/admin/folders')
     const data = await res.json()
     setFolders(data.folders || [])
   }
 
-  async function openFolder(folder: Folder) {
-    setSelectedFolder(folder)
+  // ── Abre una carpeta (carga sus archivos Y subcarpetas)
+  async function openFolder(folder: Folder, pushStack = true) {
+    if (pushStack) {
+      setFolderStack((prev) => [...prev, folder])
+    }
     setLoadingFiles(true)
     try {
-      const res = await fetch(`/api/folder-files?folder_id=${folder.id}`)
-      const data = await res.json()
-      setFiles(data.files || [])
+      const [filesRes, subfoldersRes] = await Promise.all([
+        fetch(`/api/folder-files?folder_id=${folder.id}`),
+        fetch(`/api/admin/folders?parent_id=${folder.id}`),
+      ])
+      const filesData      = await filesRes.json()
+      const subfoldersData = await subfoldersRes.json()
+      setFiles(subfoldersData.folders || [])      // reutilizamos files para mostrar
+      setSubfolders(subfoldersData.folders || [])
+      setFiles(filesData.files || [])
+      setSubfolders(subfoldersData.folders || [])
     } finally {
       setLoadingFiles(false)
     }
   }
 
+  // ── Navega a un nivel del breadcrumb
+  function navigateTo(index: number) {
+    if (index < 0) {
+      // raíz
+      setFolderStack([])
+      setFiles([])
+      setSubfolders([])
+    } else {
+      const newStack = folderStack.slice(0, index + 1)
+      setFolderStack(newStack)
+      openFolder(newStack[newStack.length - 1], false)
+    }
+  }
+
+  // ── Crear carpeta
   async function handleCreateFolder(e: React.FormEvent) {
     e.preventDefault()
     if (!folderName.trim()) return
     const fd = new FormData()
     fd.set('name', folderName.trim())
+    if (selectedFolder) fd.set('parent_id', String(selectedFolder.id))
     startTransition(async () => {
       await createFolderAction(fd)
       setFolderName('')
       setShowNewFolder(false)
-      await loadFolders()
+      if (selectedFolder) {
+        await openFolder(selectedFolder, false)
+      } else {
+        await loadFolders()
+      }
     })
   }
 
+  // ── Subir PDF individual
   async function handleUploadFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file || !selectedFolder) return
@@ -83,25 +126,65 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
     fd.set('file', file)
     fd.set('folder_id', String(selectedFolder.id))
     await uploadFileAction(fd)
-    await openFolder(selectedFolder)
+    await openFolder(selectedFolder, false)
     await loadFolders()
     setUploading(false)
     e.target.value = ''
   }
 
+  // ── Subir carpeta completa con subcarpetas
   async function handleUploadFolder(e: React.ChangeEvent<HTMLInputElement>) {
     const fileList = e.target.files
-    if (!fileList || !selectedFolder) return
+    if (!fileList || fileList.length === 0) return
+
     setUploading(true)
+    setUploadProgress('Preparando archivos...')
+
+    const fd = new FormData()
+    let index = 0
+
     for (const file of Array.from(fileList)) {
       if (!file.name.toLowerCase().endsWith('.pdf')) continue
-      const fd = new FormData()
-      fd.set('file', file)
-      fd.set('folder_id', String(selectedFolder.id))
-      await uploadFileAction(fd)
+      // webkitRelativePath = "CarpetaRaíz/Sub/archivo.pdf"
+      const relativePath = (file as File & { webkitRelativePath: string }).webkitRelativePath || file.name
+      fd.append(`file_${index}`, file)
+      fd.append(`path_${index}`, relativePath)
+      index++
     }
-    await openFolder(selectedFolder)
-    await loadFolders()
+
+    if (index === 0) {
+      setUploading(false)
+      setUploadProgress('')
+      alert('No se encontraron archivos PDF en la carpeta seleccionada.')
+      e.target.value = ''
+      return
+    }
+
+    setUploadProgress(`Subiendo ${index} PDF${index !== 1 ? 's' : ''}...`)
+
+    const result = await uploadFolderAction(fd)
+
+    if ('error' in result) {
+      alert(result.error)
+    } else if (result.success) {
+      const msg = result.skipped > 0
+        ? `✓ ${result.uploaded} subidos, ${result.skipped} omitidos`
+        : `✓ ${result.uploaded} archivos subidos correctamente`
+      setUploadProgress(msg)
+      setTimeout(() => setUploadProgress(''), 3000)
+    }
+
+    // Recargar vista actual
+    if (selectedFolder) {
+      await openFolder(selectedFolder, false)
+    } else {
+      await loadFolders()
+      // Si la carpeta subida es raíz, volver a cargar
+      const res  = await fetch('/api/admin/folders')
+      const data = await res.json()
+      setFolders(data.folders || [])
+    }
+
     setUploading(false)
     e.target.value = ''
   }
@@ -109,8 +192,11 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
   async function handleDeleteFolder(folderId: number) {
     if (!confirm('¿Eliminar esta carpeta y todos sus archivos?')) return
     await deleteFolderAction(folderId)
-    setFolders((prev) => prev.filter((f) => f.id !== folderId))
-    if (selectedFolder?.id === folderId) setSelectedFolder(null)
+    if (selectedFolder) {
+      await openFolder(selectedFolder, false)
+    } else {
+      setFolders((prev) => prev.filter((f) => f.id !== folderId))
+    }
   }
 
   async function handleDeleteFile(fileId: number) {
@@ -120,77 +206,118 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
     await loadFolders()
   }
 
+  // ── Carpetas a mostrar según nivel actual
+  const currentFolders = selectedFolder ? subfolders : folders
+
   return (
     <div className="p-8">
       {/* Header */}
       <div className="flex items-start justify-between mb-8 gap-4">
         <div>
-          <div className="flex items-center gap-2 text-muted-foreground text-sm mb-2">
+          {/* Breadcrumb */}
+          <div className="flex items-center gap-1 text-muted-foreground text-sm mb-2 flex-wrap">
             <span
               className="cursor-pointer hover:text-foreground transition-colors"
-              onClick={() => setSelectedFolder(null)}
+              onClick={() => navigateTo(-1)}
             >
               Archivos
             </span>
-            {selectedFolder && (
-              <>
+            {folderStack.map((f, i) => (
+              <span key={f.id} className="flex items-center gap-1">
                 <span>/</span>
-                <span className="text-foreground">{selectedFolder.name}</span>
-              </>
-            )}
+                <span
+                  className={`cursor-pointer hover:text-foreground transition-colors ${i === folderStack.length - 1 ? 'text-foreground' : ''}`}
+                  onClick={() => navigateTo(i)}
+                >
+                  {f.name}
+                </span>
+              </span>
+            ))}
           </div>
           <h1 className="text-2xl font-bold text-foreground">
             {selectedFolder ? selectedFolder.name : 'Gestor de Archivos'}
           </h1>
         </div>
 
-        {/* Actions */}
-        <div className="flex items-center gap-2 flex-shrink-0">
-          {!selectedFolder ? (
+        {/* Botones */}
+        <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
+          <button
+            onClick={() => setShowNewFolder(true)}
+            className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold transition border border-border text-foreground hover:bg-secondary"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+            Nueva carpeta
+          </button>
+
+          {/* Input PDF individual */}
+          <input ref={fileInputRef} type="file" accept=".pdf" className="hidden" onChange={handleUploadFile} />
+
+          {/* Input carpeta completa — webkitdirectory permite seleccionar toda una carpeta */}
+          <input
+            ref={folderInputRef}
+            type="file"
+            className="hidden"
+            // @ts-expect-error — webkitdirectory no está en los tipos de React pero funciona en todos los browsers modernos
+            webkitdirectory=""
+            multiple
+            onChange={handleUploadFolder}
+          />
+
+          {selectedFolder && (
             <button
-              onClick={() => setShowNewFolder(true)}
-              className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold text-white transition"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold text-white transition disabled:opacity-50"
               style={{ background: 'var(--samtech-blue)' }}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <line x1="12" y1="5" x2="12" y2="19" />
-                <line x1="5" y1="12" x2="19" y2="12" />
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
               </svg>
-              Nueva carpeta
+              {uploading ? 'Subiendo...' : 'Subir PDF'}
             </button>
-          ) : (
-            <>
-              <input ref={fileInputRef} type="file" accept=".pdf" className="hidden" onChange={handleUploadFile} />
-              <input ref={folderInputRef} type="file" accept=".pdf" multiple className="hidden" onChange={handleUploadFolder} />
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={uploading}
-                className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold text-white transition disabled:opacity-50"
-                style={{ background: 'var(--samtech-blue)' }}
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="17 8 12 3 7 8" />
-                  <line x1="12" y1="3" x2="12" y2="15" />
-                </svg>
-                {uploading ? 'Subiendo...' : 'Subir PDF'}
-              </button>
-              <button
-                onClick={() => folderInputRef.current?.click()}
-                disabled={uploading}
-                className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold transition disabled:opacity-50 border border-border text-foreground hover:bg-secondary"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                </svg>
-                Subir carpeta
-              </button>
-            </>
           )}
+
+          <button
+            onClick={() => folderInputRef.current?.click()}
+            disabled={uploading}
+            className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold transition disabled:opacity-50 border border-border text-foreground hover:bg-secondary"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+            </svg>
+            {uploading ? uploadProgress || 'Subiendo...' : 'Subir carpeta'}
+          </button>
         </div>
       </div>
 
-      {/* New folder dialog inline */}
+      {/* Progreso de subida */}
+      {uploadProgress && !uploading && (
+        <div
+          className="mb-4 px-4 py-2 rounded text-sm"
+          style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e' }}
+        >
+          {uploadProgress}
+        </div>
+      )}
+      {uploading && uploadProgress && (
+        <div
+          className="mb-4 px-4 py-2 rounded text-sm flex items-center gap-3"
+          style={{ background: 'rgba(0,100,255,0.08)' }}
+        >
+          <div
+            className="w-4 h-4 rounded-full border-2 animate-spin flex-shrink-0"
+            style={{ borderColor: 'var(--samtech-blue)', borderTopColor: 'transparent' }}
+          />
+          <span className="text-muted-foreground">{uploadProgress}</span>
+        </div>
+      )}
+
+      {/* Formulario nueva carpeta */}
       {showNewFolder && (
         <form
           onSubmit={handleCreateFolder}
@@ -226,10 +353,144 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
         </form>
       )}
 
-      {!selectedFolder ? (
-        /* Folder grid */
-        <div>
-          {folders.length === 0 ? (
+      {/* Contenido: subcarpetas + archivos */}
+      {loadingFiles ? (
+        <div className="flex items-center gap-3 py-12 justify-center">
+          <div
+            className="w-6 h-6 rounded-full border-2 animate-spin"
+            style={{ borderColor: 'var(--samtech-blue)', borderTopColor: 'transparent' }}
+          />
+          <span className="text-sm text-muted-foreground">Cargando...</span>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-6">
+
+          {/* Subcarpetas */}
+          {currentFolders.length > 0 && (
+            <div>
+              {selectedFolder && <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground mb-3">Subcarpetas</p>}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                {currentFolders.map((folder) => (
+                  <div
+                    key={folder.id}
+                    className="group relative flex flex-col items-start p-4 rounded-lg border border-border transition-all hover:border-primary cursor-pointer"
+                    style={{ background: 'var(--samtech-surface)' }}
+                    onClick={() => openFolder(folder)}
+                  >
+                    <div
+                      className="w-10 h-10 rounded flex items-center justify-center mb-3"
+                      style={{ background: 'rgba(0,100,255,0.12)' }}
+                    >
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--samtech-blue-bright)" strokeWidth="2">
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                      </svg>
+                    </div>
+                    <p className="text-sm font-semibold text-foreground truncate w-full">{folder.name}</p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {Number(folder.file_count) === 1 ? '1 archivo' : `${folder.file_count} archivos`}
+                    </p>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleDeleteFolder(folder.id) }}
+                      className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 w-6 h-6 flex items-center justify-center rounded transition-opacity hover:bg-destructive/20"
+                      title="Eliminar carpeta"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
+                        <polyline points="3 6 5 6 21 6" />
+                        <path d="M19 6l-1 14H6L5 6" />
+                        <path d="M10 11v6M14 11v6" />
+                        <path d="M9 6V4h6v2" />
+                      </svg>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Archivos (solo dentro de una carpeta) */}
+          {selectedFolder && (
+            <div>
+              {subfolders.length > 0 && files.length > 0 && (
+                <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground mb-3">Archivos</p>
+              )}
+              {files.length === 0 && subfolders.length === 0 ? (
+                <div className="text-center py-20">
+                  <div
+                    className="w-16 h-16 rounded-lg flex items-center justify-center mx-auto mb-4"
+                    style={{ background: 'var(--samtech-surface-raised)' }}
+                  >
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--muted-foreground)" strokeWidth="1.5">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                    </svg>
+                  </div>
+                  <p className="text-muted-foreground text-sm">Carpeta vacía. Sube un PDF o una carpeta.</p>
+                </div>
+              ) : files.length > 0 ? (
+                <div className="rounded-lg border border-border overflow-hidden" style={{ background: 'var(--samtech-surface)' }}>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border">
+                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground">Archivo</th>
+                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden md:table-cell">Tamaño</th>
+                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden lg:table-cell">Subido por</th>
+                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden lg:table-cell">Fecha</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-widest text-muted-foreground">Acciones</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {files.map((file) => (
+                        <tr key={file.id} className="border-b border-border last:border-0 hover:bg-secondary/40 transition-colors">
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-3">
+                              <div
+                                className="w-8 h-8 rounded flex items-center justify-center flex-shrink-0"
+                                style={{ background: 'rgba(255,60,60,0.12)' }}
+                              >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
+                                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                  <polyline points="14 2 14 8 20 8" />
+                                  <line x1="16" y1="13" x2="8" y2="13" />
+                                  <line x1="16" y1="17" x2="8" y2="17" />
+                                </svg>
+                              </div>
+                              <span className="font-medium text-foreground truncate max-w-[200px]">{file.name}</span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 text-muted-foreground hidden md:table-cell">{formatBytes(file.size_bytes)}</td>
+                          <td className="px-4 py-3 text-muted-foreground hidden lg:table-cell">{file.uploader_name || '—'}</td>
+                          <td className="px-4 py-3 text-muted-foreground hidden lg:table-cell">
+                            {new Date(file.created_at).toLocaleDateString('es-CL')}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                onClick={() => setViewingPdf({ pathname: file.blob_url, name: file.name })}
+                                className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
+                                style={{ background: 'rgba(0,100,255,0.15)', color: 'var(--samtech-blue-bright)' }}
+                              >
+                                Ver
+                              </button>
+                              <button
+                                onClick={() => handleDeleteFile(file.id)}
+                                className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
+                                style={{ background: 'rgba(255,60,60,0.12)', color: '#ff6b6b' }}
+                              >
+                                Eliminar
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+            </div>
+          )}
+
+          {/* Estado vacío en raíz */}
+          {!selectedFolder && folders.length === 0 && (
             <div className="text-center py-20">
               <div
                 className="w-16 h-16 rounded-lg flex items-center justify-center mx-auto mb-4"
@@ -239,139 +500,7 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
                 </svg>
               </div>
-              <p className="text-muted-foreground text-sm">No hay carpetas. Crea una para empezar.</p>
-            </div>
-          ) : (
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-              {folders.map((folder) => (
-                <div
-                  key={folder.id}
-                  className="group relative flex flex-col items-start p-4 rounded-lg border border-border transition-all hover:border-primary cursor-pointer"
-                  style={{ background: 'var(--samtech-surface)' }}
-                  onClick={() => openFolder(folder)}
-                >
-                  <div
-                    className="w-10 h-10 rounded flex items-center justify-center mb-3"
-                    style={{ background: 'rgba(0,100,255,0.12)' }}
-                  >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--samtech-blue-bright)" strokeWidth="2">
-                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                    </svg>
-                  </div>
-                  <p className="text-sm font-semibold text-foreground truncate w-full">{folder.name}</p>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    {Number(folder.file_count) === 1 ? '1 archivo' : `${folder.file_count} archivos`}
-                  </p>
-                  {/* Delete button */}
-                  <button
-                    onClick={(e) => { e.stopPropagation(); handleDeleteFolder(folder.id) }}
-                    className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 w-6 h-6 flex items-center justify-center rounded transition-opacity hover:bg-destructive/20"
-                    title="Eliminar carpeta"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
-                      <polyline points="3 6 5 6 21 6" />
-                      <path d="M19 6l-1 14H6L5 6" />
-                      <path d="M10 11v6M14 11v6" />
-                      <path d="M9 6V4h6v2" />
-                    </svg>
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      ) : (
-        /* File list inside folder */
-        <div>
-          <button
-            onClick={() => setSelectedFolder(null)}
-            className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="15 18 9 12 15 6" />
-            </svg>
-            Volver a carpetas
-          </button>
-
-          {loadingFiles ? (
-            <div className="flex items-center gap-3 py-12 justify-center">
-              <div
-                className="w-6 h-6 rounded-full border-2 animate-spin"
-                style={{ borderColor: 'var(--samtech-blue)', borderTopColor: 'transparent' }}
-              />
-              <span className="text-sm text-muted-foreground">Cargando archivos...</span>
-            </div>
-          ) : files.length === 0 ? (
-            <div className="text-center py-20">
-              <div
-                className="w-16 h-16 rounded-lg flex items-center justify-center mx-auto mb-4"
-                style={{ background: 'var(--samtech-surface-raised)' }}
-              >
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--muted-foreground)" strokeWidth="1.5">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                  <polyline points="14 2 14 8 20 8" />
-                </svg>
-              </div>
-              <p className="text-muted-foreground text-sm">Carpeta vacía. Sube un PDF para empezar.</p>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-border overflow-hidden" style={{ background: 'var(--samtech-surface)' }}>
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-border">
-                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground">Archivo</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden md:table-cell">Tamaño</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden lg:table-cell">Subido por</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden lg:table-cell">Fecha</th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-widest text-muted-foreground">Acciones</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {files.map((file) => (
-                    <tr key={file.id} className="border-b border-border last:border-0 hover:bg-secondary/40 transition-colors">
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-3">
-                          <div
-                            className="w-8 h-8 rounded flex items-center justify-center flex-shrink-0"
-                            style={{ background: 'rgba(255,60,60,0.12)' }}
-                          >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
-                              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                              <polyline points="14 2 14 8 20 8" />
-                              <line x1="16" y1="13" x2="8" y2="13" />
-                              <line x1="16" y1="17" x2="8" y2="17" />
-                            </svg>
-                          </div>
-                          <span className="font-medium text-foreground truncate max-w-[200px]">{file.name}</span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-muted-foreground hidden md:table-cell">{formatBytes(file.size_bytes)}</td>
-                      <td className="px-4 py-3 text-muted-foreground hidden lg:table-cell">{file.uploader_name || '—'}</td>
-                      <td className="px-4 py-3 text-muted-foreground hidden lg:table-cell">
-                        {new Date(file.created_at).toLocaleDateString('es-CL')}
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center justify-end gap-2">
-                          <button
-                            onClick={() => setViewingPdf({ pathname: file.blob_url, name: file.name })}
-                            className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
-                            style={{ background: 'rgba(0,100,255,0.15)', color: 'var(--samtech-blue-bright)' }}
-                          >
-                            Ver
-                          </button>
-                          <button
-                            onClick={() => handleDeleteFile(file.id)}
-                            className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
-                            style={{ background: 'rgba(255,60,60,0.12)', color: '#ff6b6b' }}
-                          >
-                            Eliminar
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <p className="text-muted-foreground text-sm">No hay carpetas. Crea una o sube una carpeta completa.</p>
             </div>
           )}
         </div>

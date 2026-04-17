@@ -1,6 +1,8 @@
 import { logoutAction } from '@/app/actions/auth'
 import type { SessionUser } from '@/lib/auth'
 import Link from 'next/link'
+import sql from '@/lib/db'
+import MfaStatusWidget from '@/components/mfa-status-widget'
 
 interface AppShellProps {
   user: SessionUser
@@ -8,14 +10,18 @@ interface AppShellProps {
   activePath?: string
 }
 
-export default function AppShell({ user, children, activePath }: AppShellProps) {
+export default async function AppShell({ user, children, activePath }: AppShellProps) {
   const isAdmin = user.role === 'admin'
+
+  // Leemos si el usuario tiene MFA activo para mostrarlo en el widget
+  const rows = await sql`SELECT totp_enabled FROM users WHERE id = ${user.id}`
+  const mfaEnabled = rows[0]?.totp_enabled ?? false
 
   const navLinks = isAdmin
     ? [
-        { href: '/admin', label: 'Archivos', icon: FolderIcon },
-        { href: '/admin/users', label: 'Usuarios', icon: UsersIcon },
-        { href: '/admin/activity', label: 'Actividad', icon: ActivityIcon },
+        { href: '/admin',          label: 'Archivos',   icon: FolderIcon   },
+        { href: '/admin/users',    label: 'Usuarios',   icon: UsersIcon    },
+        { href: '/admin/activity', label: 'Actividad',  icon: ActivityIcon },
       ]
     : [
         { href: '/drive', label: 'Mis Documentos', icon: FolderIcon },
@@ -25,6 +31,7 @@ export default function AppShell({ user, children, activePath }: AppShellProps) 
     <div className="min-h-screen flex bg-background">
       {/* Sidebar */}
       <aside className="w-60 flex flex-col border-r border-border" style={{ background: 'var(--sidebar)' }}>
+
         {/* Logo */}
         <div className="px-6 py-5 border-b border-border flex items-center gap-3">
           <div
@@ -73,9 +80,11 @@ export default function AppShell({ user, children, activePath }: AppShellProps) 
           })}
         </nav>
 
-        {/* User + logout */}
-        <div className="px-4 py-4 border-t border-border">
-          <div className="flex items-center gap-3 mb-3">
+        {/* ── Zona inferior: usuario + MFA + logout ── */}
+        <div className="px-4 py-4 border-t border-border flex flex-col gap-3">
+
+          {/* Nombre y email */}
+          <div className="flex items-center gap-3">
             <div
               className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
               style={{ background: 'var(--samtech-blue)' }}
@@ -87,6 +96,12 @@ export default function AppShell({ user, children, activePath }: AppShellProps) 
               <p className="text-xs text-muted-foreground truncate">{user.email}</p>
             </div>
           </div>
+
+          {/* ── WIDGET MFA ── */}
+          {/* Muestra si el MFA está activo o no, con botón para activar/desactivar */}
+          <MfaStatusWidget mfaEnabled={mfaEnabled} />
+
+          {/* Cerrar sesión */}
           <form action={logoutAction}>
             <button
               type="submit"
@@ -96,6 +111,7 @@ export default function AppShell({ user, children, activePath }: AppShellProps) 
               Cerrar sesión
             </button>
           </form>
+
         </div>
       </aside>
 
@@ -106,6 +122,8 @@ export default function AppShell({ user, children, activePath }: AppShellProps) 
     </div>
   )
 }
+
+// ── Íconos ──────────────────────────────────────────────────
 
 function FolderIcon({ className }: { className?: string }) {
   return (
