@@ -9,8 +9,11 @@ import {
   deleteFolderAction,
   deleteFileAction,
 } from '@/app/actions/files'
+import GlobalSearch from '@/components/global-search'
 
 const PdfViewer = dynamic(() => import('./pdf-viewer'), { ssr: false })
+
+const PAGE_SIZE = 20
 
 interface Folder {
   id: number
@@ -48,8 +51,10 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
   const [showNewFolder, setShowNewFolder] = useState(false)
   const [folderName, setFolderName]       = useState('')
   const [isPending, startTransition]      = useTransition()
-  const [uploading, setUploading]         = useState(false)
+  const [uploading, setUploading]           = useState(false)
   const [uploadProgress, setUploadProgress] = useState<string>('')
+  const [uploadPercent, setUploadPercent]   = useState(0)
+  const [page, setPage]                     = useState(1)
   const fileInputRef   = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
 
@@ -64,10 +69,9 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
 
   // ── Abre una carpeta (carga sus archivos Y subcarpetas)
   async function openFolder(folder: Folder, pushStack = true) {
-    if (pushStack) {
-      setFolderStack((prev) => [...prev, folder])
-    }
+    if (pushStack) setFolderStack((prev) => [...prev, folder])
     setLoadingFiles(true)
+    setPage(1) // resetear paginación al entrar a carpeta
     try {
       const [filesRes, subfoldersRes] = await Promise.all([
         fetch(`/api/folder-files?folder_id=${folder.id}`),
@@ -75,9 +79,7 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
       ])
       const filesData      = await filesRes.json()
       const subfoldersData = await subfoldersRes.json()
-      setFiles(subfoldersData.folders || [])      // reutilizamos files para mostrar
-      setSubfolders(subfoldersData.folders || [])
-      setFiles(filesData.files || [])
+      setFiles(filesData.files           || [])
       setSubfolders(subfoldersData.folders || [])
     } finally {
       setLoadingFiles(false)
@@ -87,10 +89,10 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
   // ── Navega a un nivel del breadcrumb
   function navigateTo(index: number) {
     if (index < 0) {
-      // raíz
       setFolderStack([])
       setFiles([])
       setSubfolders([])
+      setPage(1)
     } else {
       const newStack = folderStack.slice(0, index + 1)
       setFolderStack(newStack)
@@ -122,6 +124,8 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
     const file = e.target.files?.[0]
     if (!file || !selectedFolder) return
     setUploading(true)
+    setUploadPercent(0)
+    setUploadProgress('Subiendo archivo...')
     const fd = new FormData()
     fd.set('file', file)
     fd.set('folder_id', String(selectedFolder.id))
@@ -132,57 +136,58 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
     e.target.value = ''
   }
 
-  // ── Subir carpeta completa con subcarpetas
+  // ── Subir carpeta completa con subcarpetas + progreso por archivo
   async function handleUploadFolder(e: React.ChangeEvent<HTMLInputElement>) {
     const fileList = e.target.files
     if (!fileList || fileList.length === 0) return
 
-    setUploading(true)
-    setUploadProgress('Preparando archivos...')
+    const pdfs = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pdf'))
 
-    const fd = new FormData()
-    let index = 0
-
-    for (const file of Array.from(fileList)) {
-      if (!file.name.toLowerCase().endsWith('.pdf')) continue
-      // webkitRelativePath = "CarpetaRaíz/Sub/archivo.pdf"
-      const relativePath = (file as File & { webkitRelativePath: string }).webkitRelativePath || file.name
-      fd.append(`file_${index}`, file)
-      fd.append(`path_${index}`, relativePath)
-      index++
-    }
-
-    if (index === 0) {
-      setUploading(false)
-      setUploadProgress('')
+    if (pdfs.length === 0) {
       alert('No se encontraron archivos PDF en la carpeta seleccionada.')
       e.target.value = ''
       return
     }
 
-    setUploadProgress(`Subiendo ${index} PDF${index !== 1 ? 's' : ''}...`)
+    setUploading(true)
+    setUploadPercent(0)
+    setUploadProgress(`0 / ${pdfs.length} archivos`)
 
-    const result = await uploadFolderAction(fd)
+    // Subir uno por uno para mostrar progreso real
+    let uploaded = 0
+    let skipped  = 0
 
-    if ('error' in result) {
-      alert(result.error)
-    } else if (result.success) {
-      const msg = result.skipped > 0
-        ? `✓ ${result.uploaded} subidos, ${result.skipped} omitidos`
-        : `✓ ${result.uploaded} archivos subidos correctamente`
-      setUploadProgress(msg)
-      setTimeout(() => setUploadProgress(''), 3000)
+    for (let i = 0; i < pdfs.length; i++) {
+      const file         = pdfs[i]
+      const relativePath = (file as File & { webkitRelativePath: string }).webkitRelativePath || file.name
+      const fd           = new FormData()
+      fd.append('file_0', file)
+      fd.append('path_0', relativePath)
+
+      try {
+        const result = await uploadFolderAction(fd)
+        if ('success' in result && result.success) uploaded++
+        else skipped++
+      } catch {
+        skipped++
+      }
+
+      const percent = Math.round(((i + 1) / pdfs.length) * 100)
+      setUploadPercent(percent)
+      setUploadProgress(`${i + 1} / ${pdfs.length} archivos`)
     }
 
-    // Recargar vista actual
+    const msg = skipped > 0
+      ? `✓ ${uploaded} subidos, ${skipped} omitidos`
+      : `✓ ${uploaded} archivos subidos correctamente`
+    setUploadProgress(msg)
+    setUploadPercent(100)
+    setTimeout(() => { setUploadProgress(''); setUploadPercent(0) }, 3000)
+
     if (selectedFolder) {
       await openFolder(selectedFolder, false)
     } else {
       await loadFolders()
-      // Si la carpeta subida es raíz, volver a cargar
-      const res  = await fetch('/api/admin/folders')
-      const data = await res.json()
-      setFolders(data.folders || [])
     }
 
     setUploading(false)
@@ -210,9 +215,9 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
   const currentFolders = selectedFolder ? subfolders : folders
 
   return (
-    <div className="p-8">
+    <div className="p-4 md:p-8">
       {/* Header */}
-      <div className="flex items-start justify-between mb-8 gap-4">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between mb-6 md:mb-8 gap-3">
         <div>
           {/* Breadcrumb */}
           <div className="flex items-center gap-1 text-muted-foreground text-sm mb-2 flex-wrap">
@@ -240,7 +245,7 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
         </div>
 
         {/* Botones */}
-        <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
+        <div className="flex items-center gap-2 flex-wrap justify-start sm:justify-end">
           <button
             onClick={() => setShowNewFolder(true)}
             className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold transition border border-border text-foreground hover:bg-secondary"
@@ -295,27 +300,37 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
         </div>
       </div>
 
-      {/* Progreso de subida */}
+      {/* Barra de progreso de subida */}
+      {uploading && (
+        <div className="mb-4 rounded-lg border border-border p-4 flex flex-col gap-2" style={{ background: 'rgba(0,100,255,0.06)' }}>
+          <div className="flex items-center justify-between text-sm">
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <div className="w-3.5 h-3.5 rounded-full border-2 animate-spin flex-shrink-0" style={{ borderColor: 'var(--samtech-blue)', borderTopColor: 'transparent' }} />
+              <span>Subiendo archivos...</span>
+            </div>
+            <span className="font-semibold text-foreground">{uploadPercent}%</span>
+          </div>
+          {/* Barra */}
+          <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: 'rgba(0,100,255,0.12)' }}>
+            <div
+              className="h-full rounded-full transition-all duration-300"
+              style={{ width: `${uploadPercent}%`, background: 'var(--samtech-blue)' }}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">{uploadProgress}</p>
+        </div>
+      )}
+      {/* Mensaje de éxito tras subida */}
       {uploadProgress && !uploading && (
-        <div
-          className="mb-4 px-4 py-2 rounded text-sm"
-          style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e' }}
-        >
+        <div className="mb-4 px-4 py-2 rounded text-sm" style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e' }}>
           {uploadProgress}
         </div>
       )}
-      {uploading && uploadProgress && (
-        <div
-          className="mb-4 px-4 py-2 rounded text-sm flex items-center gap-3"
-          style={{ background: 'rgba(0,100,255,0.08)' }}
-        >
-          <div
-            className="w-4 h-4 rounded-full border-2 animate-spin flex-shrink-0"
-            style={{ borderColor: 'var(--samtech-blue)', borderTopColor: 'transparent' }}
-          />
-          <span className="text-muted-foreground">{uploadProgress}</span>
-        </div>
-      )}
+
+      {/* Barra de búsqueda global */}
+      <div className="mb-6">
+        <GlobalSearch onOpenPdf={(pathname, name) => setViewingPdf({ pathname, name })} />
+      </div>
 
       {/* Formulario nueva carpeta */}
       {showNewFolder && (
@@ -411,7 +426,11 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
           {selectedFolder && (
             <div>
               {subfolders.length > 0 && files.length > 0 && (
-                <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground mb-3">Archivos</p>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
+                    Archivos {files.length > PAGE_SIZE && `(${files.length} total)`}
+                  </p>
+                </div>
               )}
               {files.length === 0 && subfolders.length === 0 ? (
                 <div className="text-center py-20">
@@ -427,63 +446,60 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
                   <p className="text-muted-foreground text-sm">Carpeta vacía. Sube un PDF o una carpeta.</p>
                 </div>
               ) : files.length > 0 ? (
-                <div className="rounded-lg border border-border overflow-hidden" style={{ background: 'var(--samtech-surface)' }}>
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-border">
-                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground">Archivo</th>
-                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden md:table-cell">Tamaño</th>
-                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden lg:table-cell">Subido por</th>
-                        <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-muted-foreground hidden lg:table-cell">Fecha</th>
-                        <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-widest text-muted-foreground">Acciones</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {files.map((file) => (
-                        <tr key={file.id} className="border-b border-border last:border-0 hover:bg-secondary/40 transition-colors">
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-3">
-                              <div
-                                className="w-8 h-8 rounded flex items-center justify-center flex-shrink-0"
-                                style={{ background: 'rgba(255,60,60,0.12)' }}
-                              >
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
-                                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                                  <polyline points="14 2 14 8 20 8" />
-                                  <line x1="16" y1="13" x2="8" y2="13" />
-                                  <line x1="16" y1="17" x2="8" y2="17" />
-                                </svg>
-                              </div>
-                              <span className="font-medium text-foreground truncate max-w-[200px]">{file.name}</span>
-                            </div>
-                          </td>
-                          <td className="px-4 py-3 text-muted-foreground hidden md:table-cell">{formatBytes(file.size_bytes)}</td>
-                          <td className="px-4 py-3 text-muted-foreground hidden lg:table-cell">{file.uploader_name || '—'}</td>
-                          <td className="px-4 py-3 text-muted-foreground hidden lg:table-cell">
-                            {new Date(file.created_at).toLocaleDateString('es-CL')}
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex items-center justify-end gap-2">
-                              <button
-                                onClick={() => setViewingPdf({ pathname: file.blob_url, name: file.name })}
-                                className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
-                                style={{ background: 'rgba(0,100,255,0.15)', color: 'var(--samtech-blue-bright)' }}
-                              >
-                                Ver
-                              </button>
-                              <button
-                                onClick={() => handleDeleteFile(file.id)}
-                                className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
-                                style={{ background: 'rgba(255,60,60,0.12)', color: '#ff6b6b' }}
-                              >
-                                Eliminar
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                <div className="flex flex-col gap-2">
+                  {files.slice(0, page * PAGE_SIZE).map((file) => (
+                    <div
+                      key={file.id}
+                      className="flex items-center gap-3 p-3 rounded-lg border border-border"
+                      style={{ background: 'var(--samtech-surface)' }}
+                    >
+                      <div
+                        className="w-9 h-9 rounded flex items-center justify-center flex-shrink-0"
+                        style={{ background: 'rgba(255,60,60,0.12)' }}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                          <polyline points="14 2 14 8 20 8" />
+                          <line x1="16" y1="13" x2="8" y2="13" />
+                          <line x1="16" y1="17" x2="8" y2="17" />
+                        </svg>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-foreground truncate">{file.name}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {formatBytes(file.size_bytes)}
+                          <span className="hidden sm:inline"> · {file.uploader_name || '—'}</span>
+                          <span className="hidden md:inline"> · {new Date(file.created_at).toLocaleDateString('es-CL')}</span>
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <button
+                          onClick={() => setViewingPdf({ pathname: file.blob_url, name: file.name })}
+                          className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
+                          style={{ background: 'rgba(0,100,255,0.15)', color: 'var(--samtech-blue-bright)' }}
+                        >
+                          Ver
+                        </button>
+                        <button
+                          onClick={() => handleDeleteFile(file.id)}
+                          className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
+                          style={{ background: 'rgba(255,60,60,0.12)', color: '#ff6b6b' }}
+                        >
+                          Eliminar
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* Botón cargar más */}
+                  {files.length > page * PAGE_SIZE && (
+                    <button
+                      onClick={() => setPage((p) => p + 1)}
+                      className="w-full py-3 rounded-lg border border-border text-sm text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                    >
+                      Cargar más ({files.length - page * PAGE_SIZE} restantes)
+                    </button>
+                  )}
                 </div>
               ) : null}
             </div>
