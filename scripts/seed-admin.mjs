@@ -16,7 +16,7 @@ async function main() {
   const password = 'admin123'
   const hash = await bcrypt.hash(password, 10)
 
-  console.log('[v0] Generated hash:', hash)
+  console.log('Generated hash:', hash)
 
   await sql`
     INSERT INTO users (name, email, password_hash, role)
@@ -24,11 +24,11 @@ async function main() {
     ON CONFLICT (email) DO UPDATE SET password_hash = ${hash}, role = 'admin'
   `
 
-  console.log('[v0] Admin user upserted successfully!')
-  console.log('[v0] Credentials: admin@samtech.cl / admin123')
+  console.log('Admin user upserted successfully!')
+  console.log('Credentials: admin@samtech.cl / admin123')
 }
 
 main().catch((err) => {
-  console.error('[v0] Error seeding admin:', err)
+  console.error('Error seeding admin:', err)
   process.exit(1)
 })

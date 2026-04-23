@@ -1,11 +1,3 @@
-// ⚠ Reemplaza lib/auth.ts
-//
-// CACHÉ DE SESIÓN: en vez de ir a la DB en cada request,
-// guardamos los datos del usuario en una cookie firmada con HMAC.
-// La cookie session_data se renueva al hacer login y se borra al logout.
-// La cookie session_id sigue existiendo para poder invalidar sesiones
-// desde el servidor (ej: al cambiar contraseña o forzar logout).
-
 import { cookies } from 'next/headers'
 import { createHmac } from 'crypto'
 import sql from './db'
@@ -43,7 +35,7 @@ function verify(token: string): SessionUser | null {
   }
 }
 
-// ── Guarda la cookie cacheada (llamar después de crear sesión) ─
+// ── Guarda la cookie cacheada (solo llamar desde Server Actions o Route Handlers) ─
 export async function setSessionCache(user: SessionUser, expiresAt: Date) {
   const cookieStore = await cookies()
   cookieStore.set('session_data', sign(user), {
@@ -55,7 +47,7 @@ export async function setSessionCache(user: SessionUser, expiresAt: Date) {
   })
 }
 
-// ── Borra la cookie cacheada (llamar en logout) ────────────────
+// ── Borra la cookie cacheada (solo llamar desde Server Actions o Route Handlers) ─
 export async function clearSessionCache() {
   const cookieStore = await cookies()
   cookieStore.delete('session_data')
@@ -85,15 +77,12 @@ export async function getSession(): Promise<SessionUser | null> {
   `
   if (!rows.length) return null
 
-  const user = rows[0] as SessionUser
-
-  // Guardar en cookie para próximas requests
-  const expRows = await sql`SELECT expires_at FROM sessions WHERE id = ${sessionId}`
-  if (expRows.length) {
-    await setSessionCache(user, new Date(expRows[0].expires_at as string))
-  }
-
-  return user
+  // Retornar el usuario sin intentar escribir la cookie.
+  // Next.js no permite escribir cookies desde Server Components.
+  // La cookie session_data se renueva automáticamente en el próximo
+  // login (createSession) o cuando se llame setSessionCache desde
+  // un Server Action o Route Handler.
+  return rows[0] as SessionUser
 }
 
 export async function requireSession(): Promise<SessionUser> {

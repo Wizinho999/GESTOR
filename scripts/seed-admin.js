@@ -14,7 +14,7 @@ async function main() {
 
   // Generate a real bcrypt hash for "admin123"
   const hash = await bcrypt.hash('admin123', 10)
-  console.log('[v0] Generated hash:', hash)
+  console.log('Generated hash:', hash)
 
   // Create tables if they don't exist yet
   await sql`
@@ -77,12 +77,12 @@ async function main() {
           name = 'Administrador'
   `
 
-  console.log('[v0] Admin user created/updated successfully')
-  console.log('[v0] Email: admin@samtech.cl')
-  console.log('[v0] Password: admin123')
+  console.log('Admin user created/updated successfully')
+  console.log('Email: admin@samtech.cl')
+  console.log('Password: admin123')
 }
 
 main().catch((err) => {
-  console.error('[v0] Error:', err)
+  console.error('Error:', err)
   process.exit(1)
 })
