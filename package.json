@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "docker:build": "HASH=$(git rev-parse --short HEAD) && docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t registro.samtech.cl/gestor-documental:$HASH -t registro.samtech.cl/gestor-documental:latest . && echo registro.samtech.cl/gestor-documental:$HASH"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",

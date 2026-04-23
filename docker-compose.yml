@@ -1,0 +1,32 @@
+services:
+  app:
+    image: registro.samtech.cl/gestor-documental:${COMMIT}
+    container_name: app-gestor
+    environment:
+      - PORT=3000
+      - NODE_ENV=${NODE_ENV:-production}
+      - DATABASE_URL=${DATABASE_URL}
+      - SESSION_SECRET=${SESSION_SECRET}
+      - BLOB_READ_WRITE_TOKEN=${BLOB_READ_WRITE_TOKEN}
+    networks:
+      - dockernetwork
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx-gestor
+    ports:
+      - '${PORT}:443'
+    volumes:
+      - ./site.conf:/etc/nginx/conf.d/default.conf:ro
+      - /opt/samtech/certs/samtech.pem:/etc/nginx/ssl/cert.pem:ro
+      - /opt/samtech/certs/samtech.key:/etc/nginx/ssl/key.pem:ro
+    depends_on:
+      - app
+    networks:
+      - dockernetwork
+    restart: unless-stopped
+
+networks:
+  dockernetwork:
+    external: true
