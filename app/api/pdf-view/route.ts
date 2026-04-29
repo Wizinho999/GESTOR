@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server'
-import { list } from '@vercel/blob'
+import { readFile } from 'fs/promises'
+import { join } from 'path'
 import { getSession } from '@/lib/auth'
 
 export async function GET(request: NextRequest) {
@@ -12,36 +13,31 @@ export async function GET(request: NextRequest) {
   const pathname = decodeURIComponent(rawPathname)
 
   try {
-    let blobUrl = pathname
-
-    // 1. Obtener la URL real si solo tenemos el nombre
-    if (!pathname.startsWith('http')) {
-      const { blobs } = await list({ prefix: pathname, limit: 1 })
-      if (!blobs || blobs.length === 0) {
-        return new NextResponse('Blob not found', { status: 404 })
-      }
-      blobUrl = blobs[0].url
+    // El pathname viene como "/uploads/pdfs/timestamp-filename.pdf"
+    // Necesitamos leerlo desde el disco local
+    
+    if (!pathname.startsWith('/uploads/pdfs/')) {
+      return new NextResponse('Invalid path', { status: 400 })
     }
 
-    // 2. FETCH MANUAL usando el TOKEN para evitar el 403
-    // Esto es lo que permite leer archivos privados desde el servidor
-    const response = await fetch(blobUrl, {
-      headers: {
-        Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`,
-      },
-    })
-
-    if (!response.ok) {
-      console.error(`Error fetch: ${response.status}`)
-      throw new Error('Failed to fetch private content')
+    // Extraer solo el nombre del archivo
+    const filename = pathname.replace('/uploads/pdfs/', '')
+    
+    // Construir la ruta segura (prevenir path traversal)
+    const filePath = join(process.cwd(), 'public', 'uploads', 'pdfs', filename)
+    
+    // Validar que la ruta está dentro de la carpeta permitida (seguridad)
+    const allowedDir = join(process.cwd(), 'public', 'uploads', 'pdfs')
+    if (!filePath.startsWith(allowedDir)) {
+      return new NextResponse('Unauthorized path', { status: 403 })
     }
 
-    // 3. Ahora sí sacamos el buffer
-    const arrayBuffer = await response.arrayBuffer()
+    // Leer archivo del disco
+    const buffer = await readFile(filePath)
 
-    return new NextResponse(arrayBuffer, {
+    return new NextResponse(buffer, {
       headers: {
-        'Content-Type': 'application/octet-stream',
+        'Content-Type': 'application/pdf',
         'Content-Disposition': 'inline',
         'Cache-Control': 'private, no-store, no-cache, must-revalidate',
         'X-Frame-Options': 'DENY',
@@ -50,6 +46,6 @@ export async function GET(request: NextRequest) {
     })
   } catch (error) {
     console.error('Error serving PDF:', error)
-    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
+    return NextResponse.json({ error: 'File not found' }, { status: 404 })
   }
 }

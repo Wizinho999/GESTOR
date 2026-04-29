@@ -1,9 +1,14 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { put } from '@vercel/blob'
+import { writeFile } from 'fs/promises'
+import { join } from 'path'
+import { mkdir } from 'fs/promises'
 import sql from '@/lib/db'
 import { requireAdmin } from '@/lib/auth'
+
+// Carpeta donde se guardan los PDFs (crear en la raíz del proyecto o donde prefieras)
+const UPLOAD_DIR = join(process.cwd(), 'public', 'uploads', 'pdfs')
 
 export async function createFolderAction(formData: FormData) {
   const admin = await requireAdmin()
@@ -29,18 +34,31 @@ export async function uploadFileAction(formData: FormData) {
   if (!file || file.size === 0) return { error: 'Archivo requerido' }
   if (!file.name.toLowerCase().endsWith('.pdf')) return { error: 'Solo se permiten archivos PDF' }
 
-  const blob = await put(`pdfs/${Date.now()}-${file.name}`, file, {
-    access: 'private',
-    contentType: 'application/pdf',
-  })
+  try {
+    // Crear carpeta si no existe
+    await mkdir(UPLOAD_DIR, { recursive: true })
 
-  await sql`
-    INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
-    VALUES (${file.name}, ${blob.pathname}, ${folderId}, ${admin.id}, ${file.size})
-  `
-  revalidatePath('/admin')
-  revalidatePath('/drive')
-  return { success: true }
+    // Generar nombre único
+    const timestamp = Date.now()
+    const filename = `${timestamp}-${file.name}`
+    const filepath = join(UPLOAD_DIR, filename)
+
+    // Guardar archivo en disco
+    const buffer = await file.arrayBuffer()
+    await writeFile(filepath, Buffer.from(buffer))
+
+    // Guardar referencia en BD (blob_url ahora es la ruta local)
+    await sql`
+      INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
+      VALUES (${file.name}, ${`/uploads/pdfs/${filename}`}, ${folderId}, ${admin.id}, ${file.size})
+    `
+    revalidatePath('/admin')
+    revalidatePath('/drive')
+    return { success: true }
+  } catch (error) {
+    console.error('Error uploading file:', error)
+    return { error: 'Error al guardar el archivo' }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -125,28 +143,38 @@ export async function uploadFolderAction(formData: FormData) {
   let uploaded = 0
   let skipped  = 0
 
-  for (const { file, path } of entries) {
-    // path ejemplo: "AMAROK-2022/Enero/factura.pdf"
-    const parts     = path.split('/')
-    const fileName  = parts[parts.length - 1]
-    const dirParts  = parts.slice(0, -1) // carpetas sin el nombre del archivo
+  try {
+    await mkdir(UPLOAD_DIR, { recursive: true })
 
-    try {
-      const folderId = await ensureFolder(dirParts)
+    for (const { file, path } of entries) {
+      // path ejemplo: "AMAROK-2022/Enero/factura.pdf"
+      const parts     = path.split('/')
+      const fileName  = parts[parts.length - 1]
+      const dirParts  = parts.slice(0, -1) // carpetas sin el nombre del archivo
 
-      const blob = await put(`pdfs/${Date.now()}-${fileName}`, file, {
-        access:      'private',
-        contentType: 'application/pdf',
-      })
+      try {
+        const folderId = await ensureFolder(dirParts)
 
-      await sql`
-        INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
-        VALUES (${fileName}, ${blob.pathname}, ${folderId}, ${admin.id}, ${file.size})
-      `
-      uploaded++
-    } catch {
-      skipped++
+        // Guardar archivo en disco
+        const timestamp = Date.now()
+        const filename = `${timestamp}-${fileName}`
+        const filepath = join(UPLOAD_DIR, filename)
+        const buffer = await file.arrayBuffer()
+        await writeFile(filepath, Buffer.from(buffer))
+
+        // Guardar referencia en BD
+        await sql`
+          INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
+          VALUES (${fileName}, ${`/uploads/pdfs/${filename}`}, ${folderId}, ${admin.id}, ${file.size})
+        `
+        uploaded++
+      } catch {
+        skipped++
+      }
     }
+  } catch (error) {
+    console.error('Error uploading folder:', error)
+    return { error: 'Error al guardar la carpeta' }
   }
 
   revalidatePath('/admin')
@@ -164,6 +192,24 @@ export async function deleteFolderAction(folderId: number) {
 
 export async function deleteFileAction(fileId: number) {
   await requireAdmin()
+  
+  // Obtener la ruta del archivo para borrarlo del disco también
+  const file = await sql`SELECT blob_url FROM files WHERE id = ${fileId}`
+  if (file.length > 0) {
+    try {
+      const blobUrl = file[0].blob_url as string
+      // Si es una ruta local (/uploads/pdfs/...), borrar del disco
+      if (blobUrl.startsWith('/uploads/pdfs/')) {
+        const filename = blobUrl.replace('/uploads/pdfs/', '')
+        const filepath = join(UPLOAD_DIR, filename)
+        const { unlink } = await import('fs/promises')
+        await unlink(filepath).catch(() => {}) // Ignorar error si no existe
+      }
+    } catch (error) {
+      console.error('Error deleting file from disk:', error)
+    }
+  }
+
   await sql`DELETE FROM files WHERE id = ${fileId}`
   revalidatePath('/admin')
   revalidatePath('/drive')
