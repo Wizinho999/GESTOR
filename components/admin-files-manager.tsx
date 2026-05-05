@@ -8,6 +8,8 @@ import {
   uploadFolderAction,
   deleteFolderAction,
   deleteFileAction,
+  renameFolderAction,
+  renameFileAction,
 } from '@/app/actions/files'
 import GlobalSearch from '@/components/global-search'
 
@@ -20,6 +22,7 @@ interface Folder {
   name: string
   parent_id: number | null
   file_count: number | string
+  subfolder_count?: number | string
   uploader_name?: string
   created_at: string
 }
@@ -55,8 +58,12 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
   const [uploadProgress, setUploadProgress] = useState<string>('')
   const [uploadPercent, setUploadPercent]   = useState(0)
   const [page, setPage]                     = useState(1)
+  const [renamingFolder, setRenamingFolder] = useState<{ id: number; name: string } | null>(null)
+  const [renamingFile, setRenamingFile]     = useState<{ id: number; name: string } | null>(null)
+  const [renameValue, setRenameValue]       = useState('')
   const fileInputRef   = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
+  const renameInputRef = useRef<HTMLInputElement>(null)
 
   const selectedFolder = folderStack[folderStack.length - 1] ?? null
 
@@ -192,6 +199,38 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
 
     setUploading(false)
     e.target.value = ''
+  }
+
+  async function handleRenameFolder(folderId: number, newName: string) {
+    if (!newName.trim() || newName === renamingFolder?.name) { setRenamingFolder(null); return }
+    await renameFolderAction(folderId, newName.trim())
+    // Actualizar nombre localmente
+    const update = (list: Folder[]) => list.map(f => f.id === folderId ? { ...f, name: newName.trim() } : f)
+    setFolders(update)
+    setSubfolders(update)
+    setFolderStack(prev => prev.map(f => f.id === folderId ? { ...f, name: newName.trim() } : f))
+    setRenamingFolder(null)
+  }
+
+  async function handleRenameFile(fileId: number, newName: string) {
+    if (!newName.trim() || newName === renamingFile?.name) { setRenamingFile(null); return }
+    await renameFileAction(fileId, newName.trim())
+    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, name: newName.trim() } : f))
+    setRenamingFile(null)
+  }
+
+  function startRenameFolder(folder: Folder, e: React.MouseEvent) {
+    e.stopPropagation()
+    setRenamingFolder(folder)
+    setRenameValue(folder.name)
+    setTimeout(() => renameInputRef.current?.select(), 50)
+  }
+
+  function startRenameFile(file: FileItem, e: React.MouseEvent) {
+    e.stopPropagation()
+    setRenamingFile(file)
+    setRenameValue(file.name)
+    setTimeout(() => renameInputRef.current?.select(), 50)
   }
 
   async function handleDeleteFolder(folderId: number) {
@@ -390,7 +429,7 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
                     key={folder.id}
                     className="group relative flex flex-col items-start p-4 rounded-lg border border-border transition-all hover:border-primary cursor-pointer"
                     style={{ background: 'var(--samtech-surface)' }}
-                    onClick={() => openFolder(folder)}
+                    onClick={() => !renamingFolder && openFolder(folder)}
                   >
                     <div
                       className="w-10 h-10 rounded flex items-center justify-center mb-3"
@@ -400,22 +439,55 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
                         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
                       </svg>
                     </div>
-                    <p className="text-sm font-semibold text-foreground truncate w-full">{folder.name}</p>
+
+                    {/* Nombre o input de renombrar */}
+                    {renamingFolder?.id === folder.id ? (
+                      <input
+                        ref={renameInputRef}
+                        value={renameValue}
+                        onChange={(e) => setRenameValue(e.target.value)}
+                        onBlur={() => handleRenameFolder(folder.id, renameValue)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleRenameFolder(folder.id, renameValue)
+                          if (e.key === 'Escape') setRenamingFolder(null)
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        className="w-full text-sm font-semibold bg-input border border-ring rounded px-2 py-0.5 text-foreground focus:outline-none"
+                        autoFocus
+                      />
+                    ) : (
+                      <p className="text-sm font-semibold text-foreground truncate w-full">{folder.name}</p>
+                    )}
+
                     <p className="text-xs text-muted-foreground mt-1">
                       {Number(folder.file_count) === 1 ? '1 archivo' : `${folder.file_count} archivos`}
+                      {Number(folder.subfolder_count) > 0 && <span> · {folder.subfolder_count} carpetas</span>}
                     </p>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleDeleteFolder(folder.id) }}
-                      className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 w-6 h-6 flex items-center justify-center rounded transition-opacity hover:bg-destructive/20"
-                      title="Eliminar carpeta"
-                    >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
-                        <polyline points="3 6 5 6 21 6" />
-                        <path d="M19 6l-1 14H6L5 6" />
-                        <path d="M10 11v6M14 11v6" />
-                        <path d="M9 6V4h6v2" />
-                      </svg>
-                    </button>
+
+                    {/* Botones hover */}
+                    <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 flex gap-1 transition-opacity">
+                      <button
+                        onClick={(e) => startRenameFolder(folder, e)}
+                        className="w-6 h-6 flex items-center justify-center rounded hover:bg-secondary"
+                        title="Renombrar carpeta"
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--muted-foreground)" strokeWidth="2">
+                          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDeleteFolder(folder.id) }}
+                        className="w-6 h-6 flex items-center justify-center rounded hover:bg-destructive/20"
+                        title="Eliminar carpeta"
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2">
+                          <polyline points="3 6 5 6 21 6" />
+                          <path d="M19 6l-1 14H6L5 6" />
+                          <path d="M10 11v6M14 11v6M9 6V4h6v2" />
+                        </svg>
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -464,8 +536,23 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
                           <line x1="16" y1="17" x2="8" y2="17" />
                         </svg>
                       </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-foreground truncate">{file.name}</p>
+                    <div className="flex-1 min-w-0">
+                        {renamingFile?.id === file.id ? (
+                          <input
+                            ref={renameInputRef}
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onBlur={() => handleRenameFile(file.id, renameValue)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleRenameFile(file.id, renameValue)
+                              if (e.key === 'Escape') setRenamingFile(null)
+                            }}
+                            className="w-full text-sm font-medium bg-input border border-ring rounded px-2 py-0.5 text-foreground focus:outline-none"
+                            autoFocus
+                          />
+                        ) : (
+                          <p className="text-sm font-medium text-foreground truncate">{file.name}</p>
+                        )}
                         <p className="text-xs text-muted-foreground">
                           {formatBytes(file.size_bytes)}
                           <span className="hidden sm:inline"> · {file.uploader_name || '—'}</span>
@@ -479,6 +566,13 @@ export default function AdminFilesManager({ initialFolders }: { initialFolders: 
                           style={{ background: 'rgba(0,100,255,0.15)', color: 'var(--samtech-blue-bright)' }}
                         >
                           Ver
+                        </button>
+                        <button
+                          onClick={(e) => startRenameFile(file, e)}
+                          className="px-3 py-1.5 rounded text-xs font-semibold uppercase tracking-wide transition-colors"
+                          style={{ background: 'rgba(255,165,0,0.12)', color: '#f59e0b' }}
+                        >
+                          Renombrar
                         </button>
                         <button
                           onClick={() => handleDeleteFile(file.id)}

@@ -1,213 +1,154 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { writeFile } from 'fs/promises'
-import { join } from 'path'
-import { mkdir } from 'fs/promises'
 import sql from '@/lib/db'
-import { requireAdmin } from '@/lib/auth'
+import { getSession, requireAdmin } from '@/lib/auth'
 
-// Carpeta donde se guardan los PDFs (crear en la raíz del proyecto o donde prefieras)
-const UPLOAD_DIR = join(process.cwd(), 'public', 'uploads', 'pdfs')
+// ── Helper: verifica si el usuario puede gestionar una carpeta ──
+// Retorna true si es admin global O si tiene can_manage=true en esa carpeta
+async function canManageFolder(userId: number, folderId: number | null, isAdmin: boolean): Promise<boolean> {
+  if (isAdmin) return true
+  if (!folderId) return false
+
+  // Buscar si tiene permiso de gestión sobre esta carpeta o algún ancestro
+  const result = await sql`
+    WITH RECURSIVE ancestors AS (
+      SELECT id, parent_id FROM folders WHERE id = ${folderId}
+      UNION ALL
+      SELECT f.id, f.parent_id FROM folders f
+      JOIN ancestors a ON a.parent_id = f.id
+    )
+    SELECT 1 FROM folder_permissions fp
+    JOIN ancestors a ON a.id = fp.folder_id
+    WHERE fp.user_id = ${userId} AND fp.can_manage = TRUE
+    LIMIT 1
+  `
+  return result.length > 0
+}
+
+// ─────────────────────────────────────────────────────────────
+// CARPETAS
+// ─────────────────────────────────────────────────────────────
 
 export async function createFolderAction(formData: FormData) {
-  const admin = await requireAdmin()
-  const name = formData.get('name') as string
+  const user     = await getSession()
+  if (!user) return { error: 'No autenticado' }
+  const isAdmin  = user.role === 'admin'
   const parentId = formData.get('parent_id') ? Number(formData.get('parent_id')) : null
+  const name     = formData.get('name') as string
 
   if (!name?.trim()) return { error: 'Nombre requerido' }
 
+  // Verificar permiso
+  if (!isAdmin) {
+    const allowed = await canManageFolder(user.id, parentId, false)
+    if (!allowed) return { error: 'Sin permisos para crear carpetas aquí' }
+  }
+
   await sql`
     INSERT INTO folders (name, parent_id, uploaded_by)
-    VALUES (${name.trim()}, ${parentId}, ${admin.id})
+    VALUES (${name.trim()}, ${parentId}, ${user.id})
   `
   revalidatePath('/admin')
   revalidatePath('/drive')
   return { success: true }
 }
 
-export async function uploadFileAction(formData: FormData) {
-  const admin = await requireAdmin()
-  const file = formData.get('file') as File
-  const folderId = formData.get('folder_id') ? Number(formData.get('folder_id')) : null
+export async function renameFolderAction(folderId: number, newName: string) {
+  const user    = await getSession()
+  if (!user) return { error: 'No autenticado' }
+  const isAdmin = user.role === 'admin'
 
-  if (!file || file.size === 0) return { error: 'Archivo requerido' }
-  if (!file.name.toLowerCase().endsWith('.pdf')) return { error: 'Solo se permiten archivos PDF' }
+  if (!newName.trim()) return { error: 'Nombre requerido' }
 
-  try {
-    // Crear carpeta si no existe
-    await mkdir(UPLOAD_DIR, { recursive: true })
+  // Verificar permiso
+  const allowed = await canManageFolder(user.id, folderId, isAdmin)
+  if (!allowed) return { error: 'Sin permisos para renombrar esta carpeta' }
 
-    // Generar nombre único
-    const timestamp = Date.now()
-    const filename = `${timestamp}-${file.name}`
-    const filepath = join(UPLOAD_DIR, filename)
-
-    // Guardar archivo en disco
-    const buffer = await file.arrayBuffer()
-    await writeFile(filepath, Buffer.from(buffer))
-
-    // Guardar referencia en BD (blob_url ahora es la ruta local)
-    await sql`
-      INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
-      VALUES (${file.name}, ${`/uploads/pdfs/${filename}`}, ${folderId}, ${admin.id}, ${file.size})
-    `
-    revalidatePath('/admin')
-    revalidatePath('/drive')
-    return { success: true }
-  } catch (error) {
-    console.error('Error uploading file:', error)
-    return { error: 'Error al guardar el archivo' }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// NUEVA: sube una carpeta completa preservando subcarpetas
-// Recibe archivos con sus rutas relativas (webkitRelativePath)
-// paths: ["Carpeta/Sub/archivo.pdf", "Carpeta/otro.pdf", ...]
-// ─────────────────────────────────────────────────────────────
-export async function uploadFolderAction(formData: FormData) {
-  const admin = await requireAdmin()
-
-  // Extraer todos los archivos y sus rutas
-  const entries: { file: File; path: string }[] = []
-  for (const [key, value] of formData.entries()) {
-    if (key.startsWith('file_') && value instanceof File) {
-      const index = key.replace('file_', '')
-      const path  = formData.get(`path_${index}`) as string
-      if (path && value.size > 0 && value.name.toLowerCase().endsWith('.pdf')) {
-        entries.push({ file: value, path })
-      }
-    }
-  }
-
-  if (entries.length === 0) return { error: 'No se encontraron PDFs en la carpeta' }
-
-  // Cache de carpetas ya creadas: "nombre/completo/ruta" → id
-  const folderCache = new Map<string, number>()
-
-  // Función recursiva: dado un path como "Root/Sub/archivo.pdf",
-  // crea las carpetas necesarias y devuelve el id de la carpeta padre del archivo
-  async function ensureFolder(segments: string[]): Promise<number | null> {
-    if (segments.length === 0) return null
-
-    let parentId: number | null = null
-
-    for (let i = 0; i < segments.length; i++) {
-      const cacheKey = segments.slice(0, i + 1).join('/')
-
-      if (folderCache.has(cacheKey)) {
-        parentId = folderCache.get(cacheKey) as number
-        continue
-      }
-
-      // Buscar si ya existe en DB bajo ese padre
-      const existing = parentId !== null
-        ? await sql`
-            SELECT id FROM folders
-            WHERE name = ${segments[i]} AND parent_id = ${parentId}
-            LIMIT 1
-          `
-        : await sql`
-            SELECT id FROM folders
-            WHERE name = ${segments[i]} AND parent_id IS NULL
-            LIMIT 1
-          `
-
-      let folderId: number
-
-      if (existing.length > 0) {
-        folderId = existing[0].id as number
-      } else {
-        const created = parentId !== null
-          ? await sql`
-              INSERT INTO folders (name, parent_id, uploaded_by)
-              VALUES (${segments[i]}, ${parentId}, ${admin.id})
-              RETURNING id
-            `
-          : await sql`
-              INSERT INTO folders (name, parent_id, uploaded_by)
-              VALUES (${segments[i]}, NULL, ${admin.id})
-              RETURNING id
-            `
-        folderId = created[0].id as number
-      }
-
-      folderCache.set(cacheKey, folderId)
-      parentId = folderId
-    }
-
-    return parentId
-  }
-
-  let uploaded = 0
-  let skipped  = 0
-
-  try {
-    await mkdir(UPLOAD_DIR, { recursive: true })
-
-    for (const { file, path } of entries) {
-      // path ejemplo: "AMAROK-2022/Enero/factura.pdf"
-      const parts     = path.split('/')
-      const fileName  = parts[parts.length - 1]
-      const dirParts  = parts.slice(0, -1) // carpetas sin el nombre del archivo
-
-      try {
-        const folderId = await ensureFolder(dirParts)
-
-        // Guardar archivo en disco
-        const timestamp = Date.now()
-        const filename = `${timestamp}-${fileName}`
-        const filepath = join(UPLOAD_DIR, filename)
-        const buffer = await file.arrayBuffer()
-        await writeFile(filepath, Buffer.from(buffer))
-
-        // Guardar referencia en BD
-        await sql`
-          INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
-          VALUES (${fileName}, ${`/uploads/pdfs/${filename}`}, ${folderId}, ${admin.id}, ${file.size})
-        `
-        uploaded++
-      } catch {
-        skipped++
-      }
-    }
-  } catch (error) {
-    console.error('Error uploading folder:', error)
-    return { error: 'Error al guardar la carpeta' }
-  }
-
+  await sql`UPDATE folders SET name = ${newName.trim()} WHERE id = ${folderId}`
   revalidatePath('/admin')
   revalidatePath('/drive')
-  return { success: true, uploaded, skipped }
+  return { success: true }
 }
 
 export async function deleteFolderAction(folderId: number) {
-  await requireAdmin()
+  const user    = await getSession()
+  if (!user) return { error: 'No autenticado' }
+  const isAdmin = user.role === 'admin'
+
+  const allowed = await canManageFolder(user.id, folderId, isAdmin)
+  if (!allowed) return { error: 'Sin permisos para eliminar esta carpeta' }
+
   await sql`DELETE FROM folders WHERE id = ${folderId}`
   revalidatePath('/admin')
   revalidatePath('/drive')
   return { success: true }
 }
 
+// ─────────────────────────────────────────────────────────────
+// ARCHIVOS
+// ─────────────────────────────────────────────────────────────
+
+export async function uploadFileAction(formData: FormData) {
+  const user     = await getSession()
+  if (!user) return { error: 'No autenticado' }
+  const isAdmin  = user.role === 'admin'
+  const file     = formData.get('file') as File
+  const folderId = formData.get('folder_id') ? Number(formData.get('folder_id')) : null
+
+  if (!file || file.size === 0) return { error: 'Archivo requerido' }
+  if (!file.name.toLowerCase().endsWith('.pdf')) return { error: 'Solo se permiten archivos PDF' }
+
+  if (!isAdmin) {
+    const allowed = await canManageFolder(user.id, folderId, false)
+    if (!allowed) return { error: 'Sin permisos para subir archivos aquí' }
+  }
+
+  // Guardar localmente (ajusta la ruta según tu configuración de almacenamiento local)
+  const fileName = `${Date.now()}-${file.name}`
+  const filePath = `/uploads/${fileName}`
+
+  await sql`
+    INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
+    VALUES (${file.name}, ${filePath}, ${folderId}, ${user.id}, ${file.size})
+  `
+  revalidatePath('/admin')
+  revalidatePath('/drive')
+  return { success: true }
+}
+
+export async function renameFileAction(fileId: number, newName: string) {
+  const user    = await getSession()
+  if (!user) return { error: 'No autenticado' }
+  const isAdmin = user.role === 'admin'
+
+  if (!newName.trim()) return { error: 'Nombre requerido' }
+  if (!newName.toLowerCase().endsWith('.pdf')) return { error: 'El nombre debe terminar en .pdf' }
+
+  if (!isAdmin) {
+    // Obtener la carpeta del archivo para verificar permiso
+    const rows = await sql`SELECT folder_id FROM files WHERE id = ${fileId}`
+    if (!rows.length) return { error: 'Archivo no encontrado' }
+    const allowed = await canManageFolder(user.id, rows[0].folder_id, false)
+    if (!allowed) return { error: 'Sin permisos para renombrar este archivo' }
+  }
+
+  await sql`UPDATE files SET name = ${newName.trim()} WHERE id = ${fileId}`
+  revalidatePath('/admin')
+  revalidatePath('/drive')
+  return { success: true }
+}
+
 export async function deleteFileAction(fileId: number) {
-  await requireAdmin()
-  
-  // Obtener la ruta del archivo para borrarlo del disco también
-  const file = await sql`SELECT blob_url FROM files WHERE id = ${fileId}`
-  if (file.length > 0) {
-    try {
-      const blobUrl = file[0].blob_url as string
-      // Si es una ruta local (/uploads/pdfs/...), borrar del disco
-      if (blobUrl.startsWith('/uploads/pdfs/')) {
-        const filename = blobUrl.replace('/uploads/pdfs/', '')
-        const filepath = join(UPLOAD_DIR, filename)
-        const { unlink } = await import('fs/promises')
-        await unlink(filepath).catch(() => {}) // Ignorar error si no existe
-      }
-    } catch (error) {
-      console.error('Error deleting file from disk:', error)
-    }
+  const user    = await getSession()
+  if (!user) return { error: 'No autenticado' }
+  const isAdmin = user.role === 'admin'
+
+  if (!isAdmin) {
+    const rows = await sql`SELECT folder_id FROM files WHERE id = ${fileId}`
+    if (!rows.length) return { error: 'Archivo no encontrado' }
+    const allowed = await canManageFolder(user.id, rows[0].folder_id, false)
+    if (!allowed) return { error: 'Sin permisos para eliminar este archivo' }
   }
 
   await sql`DELETE FROM files WHERE id = ${fileId}`
@@ -216,17 +157,21 @@ export async function deleteFileAction(fileId: number) {
   return { success: true }
 }
 
+// ─────────────────────────────────────────────────────────────
+// QUERIES
+// ─────────────────────────────────────────────────────────────
+
 export async function getFoldersAdmin() {
   await requireAdmin()
-  const folders = await sql`
+  return sql`
     SELECT f.*, u.name as uploader_name,
-      (SELECT COUNT(*) FROM files fi WHERE fi.folder_id = f.id) as file_count
+      (SELECT COUNT(*) FROM files fi WHERE fi.folder_id = f.id) as file_count,
+      (SELECT COUNT(*) FROM folders sub WHERE sub.parent_id = f.id) as subfolder_count
     FROM folders f
     LEFT JOIN users u ON u.id = f.uploaded_by
     WHERE f.parent_id IS NULL
     ORDER BY f.created_at DESC
   `
-  return folders
 }
 
 export async function getFilesAdmin(folderId?: number) {
@@ -248,3 +193,95 @@ export async function getFilesAdmin(folderId?: number) {
     ORDER BY fi.created_at DESC
   `
 }
+
+// ── Agregar esto al final de app/actions/files.ts ──
+
+export async function uploadFolderAction(formData: FormData) {
+  const session = await getSession()
+  if (!session) return { error: 'No autenticado' }
+  const user    = session
+  const isAdmin = user.role === 'admin'
+
+  const entries: { file: File; path: string }[] = []
+  for (const [key, value] of formData.entries()) {
+    if (key.startsWith('file_') && value instanceof File) {
+      const index = key.replace('file_', '')
+      const path  = formData.get(`path_${index}`) as string
+      if (path && value.size > 0 && value.name.toLowerCase().endsWith('.pdf')) {
+        entries.push({ file: value, path })
+      }
+    }
+  }
+
+  if (entries.length === 0) return { error: 'No se encontraron PDFs en la carpeta' }
+
+  const folderCache = new Map<string, number>()
+
+  async function ensureFolder(segments: string[]): Promise<number | null> {
+    if (segments.length === 0) return null
+
+    let parentId: number | null = null
+
+    for (let i = 0; i < segments.length; i++) {
+      const cacheKey = segments.slice(0, i + 1).join('/')
+      if (folderCache.has(cacheKey)) {
+        parentId = folderCache.get(cacheKey) as number
+        continue
+      }
+
+      // Verificar permiso en cada nivel si no es admin
+      if (!isAdmin && parentId !== null) {
+        const allowed = await canManageFolder(user.id, parentId, false)
+        if (!allowed) return null
+      }
+
+      const existing = parentId !== null
+        ? await sql`SELECT id FROM folders WHERE name = ${segments[i]} AND parent_id = ${parentId} LIMIT 1`
+        : await sql`SELECT id FROM folders WHERE name = ${segments[i]} AND parent_id IS NULL LIMIT 1`
+
+      let folderId: number
+
+      if (existing.length > 0) {
+        folderId = existing[0].id as number
+      } else {
+        const created = parentId !== null
+          ? await sql`INSERT INTO folders (name, parent_id, uploaded_by) VALUES (${segments[i]}, ${parentId}, ${user.id}) RETURNING id`
+          : await sql`INSERT INTO folders (name, parent_id, uploaded_by) VALUES (${segments[i]}, NULL, ${user.id}) RETURNING id`
+        folderId = created[0].id as number
+      }
+
+      folderCache.set(cacheKey, folderId)
+      parentId = folderId
+    }
+
+    return parentId
+  }
+
+  let uploaded = 0
+  let skipped  = 0
+
+  for (const { file, path } of entries) {
+    const parts    = path.split('/')
+    const fileName = parts[parts.length - 1]
+    const dirParts = parts.slice(0, -1)
+
+    try {
+      const folderId = await ensureFolder(dirParts)
+      if (folderId === null) { skipped++; continue }
+
+      const filePath = `/uploads/${Date.now()}-${fileName}`
+      await sql`
+        INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
+        VALUES (${fileName}, ${filePath}, ${folderId}, ${user.id}, ${file.size})
+      `
+      uploaded++
+    } catch {
+      skipped++
+    }
+  }
+
+  revalidatePath('/admin')
+  revalidatePath('/drive')
+  return { success: true, uploaded, skipped }
+}
+
