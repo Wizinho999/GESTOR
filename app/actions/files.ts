@@ -1,6 +1,8 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { unlink } from 'fs/promises'
+import { join } from 'path'
 import sql from '@/lib/db'
 import { getSession, requireAdmin } from '@/lib/auth'
 
@@ -96,8 +98,11 @@ export async function uploadFileAction(formData: FormData) {
   const file     = formData.get('file') as File
   const folderId = formData.get('folder_id') ? Number(formData.get('folder_id')) : null
 
+  const MAX_FILE_SIZE = 20 * 1024 * 1024 // 20 MB
+
   if (!file || file.size === 0) return { error: 'Archivo requerido' }
   if (!file.name.toLowerCase().endsWith('.pdf')) return { error: 'Solo se permiten archivos PDF' }
+  if (file.size > MAX_FILE_SIZE) return { error: 'El archivo supera el límite de 20 MB' }
 
   if (!isAdmin) {
     const allowed = await canManageFolder(user.id, folderId, false)
@@ -202,12 +207,14 @@ export async function uploadFolderAction(formData: FormData) {
   const user    = session
   const isAdmin = user.role === 'admin'
 
+  const MAX_FILE_SIZE = 20 * 1024 * 1024 // 20 MB
+
   const entries: { file: File; path: string }[] = []
   for (const [key, value] of formData.entries()) {
     if (key.startsWith('file_') && value instanceof File) {
       const index = key.replace('file_', '')
       const path  = formData.get(`path_${index}`) as string
-      if (path && value.size > 0 && value.name.toLowerCase().endsWith('.pdf')) {
+      if (path && value.size > 0 && value.size <= MAX_FILE_SIZE && value.name.toLowerCase().endsWith('.pdf')) {
         entries.push({ file: value, path })
       }
     }

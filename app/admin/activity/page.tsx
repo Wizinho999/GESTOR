@@ -19,7 +19,7 @@ export default async function AdminActivityPage() {
 
   const stats = await sql`
     SELECT
-      (SELECT COUNT(*) FROM users WHERE role = 'user') AS total_users,
+      (SELECT COUNT(*) FROM users) AS total_users,
       (SELECT COUNT(*) FROM folders) AS total_folders,
       (SELECT COUNT(*) FROM files) AS total_files,
       (SELECT COALESCE(SUM(size_bytes),0) FROM files) AS total_size
