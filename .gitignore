@@ -14,3 +14,6 @@ next.user-config.*
 node_modules
 .next/
 .DS_Store
+
+# Uploaded PDFs (stored on server volume, not in repo)
+public/uploads/pdfs/

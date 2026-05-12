@@ -49,14 +49,16 @@ export default function PdfViewer({ pathname, fileName, onClose }: PdfViewerProp
     const canvasRef = useRef<HTMLCanvasElement>(null)
     
     useEffect(() => {
+      let cancelled = false
       let renderTask: any = null
       async function render() {
         if (!canvasRef.current || !pdfDoc) return
         const page = await pdfDoc.getPage(pageNum)
-        const viewport = page.getViewport({ scale })
+        if (cancelled || !canvasRef.current) return
         const canvas = canvasRef.current
+        const viewport = page.getViewport({ scale })
         const context = canvas.getContext('2d', { alpha: false })!
-        
+
         const dpr = window.devicePixelRatio || 1
         canvas.width = viewport.width * dpr
         canvas.height = viewport.height * dpr
@@ -71,7 +73,7 @@ export default function PdfViewer({ pathname, fileName, onClose }: PdfViewerProp
         await renderTask.promise.catch(() => {})
       }
       render()
-      return () => renderTask?.cancel()
+      return () => { cancelled = true; renderTask?.cancel() }
     }, [pdfDoc, pageNum, scale])
 
     return <canvas ref={canvasRef} className="shadow-lg mb-6 bg-white" />

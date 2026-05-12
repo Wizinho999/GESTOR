@@ -1,7 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { unlink } from 'fs/promises'
+import { writeFile, unlink, mkdir } from 'fs/promises'
 import { join } from 'path'
 import sql from '@/lib/db'
 import { getSession, requireAdmin } from '@/lib/auth'
@@ -109,13 +109,16 @@ export async function uploadFileAction(formData: FormData) {
     if (!allowed) return { error: 'Sin permisos para subir archivos aquí' }
   }
 
-  // Guardar localmente (ajusta la ruta según tu configuración de almacenamiento local)
-  const fileName = `${Date.now()}-${file.name}`
-  const filePath = `/uploads/${fileName}`
+  const fileName  = `${Date.now()}-${file.name}`
+  const uploadDir = join(process.cwd(), 'public', 'uploads', 'pdfs')
+  const filePath  = join(uploadDir, fileName)
+
+  await mkdir(uploadDir, { recursive: true })
+  await writeFile(filePath, Buffer.from(await file.arrayBuffer()))
 
   await sql`
     INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
-    VALUES (${file.name}, ${filePath}, ${folderId}, ${user.id}, ${file.size})
+    VALUES (${file.name}, ${'/uploads/pdfs/' + fileName}, ${folderId}, ${user.id}, ${file.size})
   `
   revalidatePath('/admin')
   revalidatePath('/drive')
@@ -149,14 +152,19 @@ export async function deleteFileAction(fileId: number) {
   if (!user) return { error: 'No autenticado' }
   const isAdmin = user.role === 'admin'
 
+  const rows = await sql`SELECT folder_id, blob_url FROM files WHERE id = ${fileId}`
+  if (!rows.length) return { error: 'Archivo no encontrado' }
+
   if (!isAdmin) {
-    const rows = await sql`SELECT folder_id FROM files WHERE id = ${fileId}`
-    if (!rows.length) return { error: 'Archivo no encontrado' }
     const allowed = await canManageFolder(user.id, rows[0].folder_id, false)
     if (!allowed) return { error: 'Sin permisos para eliminar este archivo' }
   }
 
   await sql`DELETE FROM files WHERE id = ${fileId}`
+
+  const physicalPath = join(process.cwd(), 'public', rows[0].blob_url)
+  await unlink(physicalPath).catch(() => {})
+
   revalidatePath('/admin')
   revalidatePath('/drive')
   return { success: true }
@@ -276,10 +284,14 @@ export async function uploadFolderAction(formData: FormData) {
       const folderId = await ensureFolder(dirParts)
       if (folderId === null) { skipped++; continue }
 
-      const filePath = `/uploads/${Date.now()}-${fileName}`
+      const storedName = `${Date.now()}-${fileName}`
+      const uploadDir  = join(process.cwd(), 'public', 'uploads', 'pdfs')
+      await mkdir(uploadDir, { recursive: true })
+      await writeFile(join(uploadDir, storedName), Buffer.from(await file.arrayBuffer()))
+
       await sql`
         INSERT INTO files (name, blob_url, folder_id, uploaded_by, size_bytes)
-        VALUES (${fileName}, ${filePath}, ${folderId}, ${user.id}, ${file.size})
+        VALUES (${fileName}, ${'/uploads/pdfs/' + storedName}, ${folderId}, ${user.id}, ${file.size})
       `
       uploaded++
     } catch {
