@@ -40,18 +40,7 @@ export default async function LoginPage() {
       <div className="relative z-10 w-full max-w-sm px-6">
         {/* Logo / Brand */}
         <div className="text-center mb-10">
-          <div className="inline-flex items-center gap-3 mb-3">
-            <div
-              className="w-10 h-10 flex items-center justify-center"
-              style={{ background: 'var(--samtech-blue)', clipPath: 'polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%)' }}
-            >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <polyline points="14 2 14 8 20 8" />
-              </svg>
-            </div>
-            <span className="text-2xl font-bold tracking-widest text-foreground uppercase">SAMTECH</span>
-          </div>
+          <img src="/logo samtech blanco.svg" alt="Logo" className="h-12 mx-auto mb-3" />
           <p className="text-muted-foreground text-sm tracking-wide uppercase">Portal de Documentos</p>
         </div>
 
